@@ -55,9 +55,14 @@ your finger, or use it at the GDM login screen and at `sudo` prompts.
 4. `python3-validity`'s own postinst downloads Lenovo's Windows driver
    package and extracts the sensor firmware from it — no user action
    needed, but it does require network access to `download.lenovo.com`.
-5. Installs a systemd drop-in that removes the driver's default `--debug`
-   flag. Without this, every TLS-encrypted frame exchanged with the
-   sensor gets dumped to the journal — harmless but very noisy.
+5. Installs two systemd drop-ins:
+   - `python3-validity.service`: removes the driver's default `--debug`
+     flag (otherwise every TLS-encrypted frame exchanged with the sensor
+     gets dumped to the journal — harmless but very noisy), and adds
+     `Restart=on-failure`.
+   - `open-fprintd-resume.service`: restarts the driver after
+     suspend/resume before running the stock resume hook, which on its
+     own fails on this hardware — see "Fingerprint stops working after suspend" below.
 6. Runs `pam-auth-update --enable fprintd`, which inserts `pam_fprintd.so`
    ahead of the password check in `/etc/pam.d/common-auth`. Fingerprint is
    tried first (10s timeout, 1 attempt) and falls back to your password
@@ -113,6 +118,47 @@ you're not sure.
 
 Both scripts handle the "resource busy" issue below automatically.
 
+### Fingerprint stops working after suspend
+
+Symptom: works after a fresh boot, but after closing the lid / suspending
+the reader no longer responds until you reboot.
+`systemctl --failed` shows `open-fprintd-resume.service` failed, and
+`journalctl -u open-fprintd-resume` ends with
+`usb.core.USBError: [Errno 19] No such device`.
+
+Cause: on resume the sensor often drops off the USB bus and comes back with a
+new device number (`journalctl -k | grep 'usb 1-9'` shows
+`USB disconnect` then `new full-speed USB device`). The running driver
+still holds the old handle, so the stock resume hook — which asks the
+driver to reopen the sensor over D-Bus — fails. The driver's udev rule
+should restart the service on remove/add, but both events arrive within
+the same second, systemd merges the queued stop + start jobs into a no-op,
+and the old process keeps running with a dead handle.
+
+Fix: the installer drops in an override so the resume hook restarts the
+driver first and only then runs the stock `resume.py`. Don't just replace
+`resume.py` with the restart: open-fprintd marks the device "suspended"
+when the machine sleeps and only clears that flag when `resume.py` calls
+its `Resume` method. Without it, every verify request is silently queued
+(`The service is suspended / offline, delay the call` in
+`journalctl -u open-fprintd`) and the reader still looks dead.
+
+If you installed with an older version of this script, just re-run it.
+Or do it by hand:
+
+```bash
+sudo mkdir -p /etc/systemd/system/open-fprintd-resume.service.d
+sudo tee /etc/systemd/system/open-fprintd-resume.service.d/override.conf <<'CONF'
+[Service]
+ExecStart=
+ExecStartPre=/bin/udevadm settle --timeout=10
+ExecStart=/bin/systemctl restart python3-validity.service
+ExecStart=/usr/lib/open-fprintd/resume.py
+CONF
+sudo systemctl daemon-reload
+sudo systemctl start open-fprintd-resume.service   # recover right now, no reboot
+```
+
 ### `usb.core.USBError: [Errno 16] Resource busy` when touching the sensor directly
 
 A udev rule (`/lib/udev/rules.d/60-python3-validity.rules`) auto-restarts
@@ -156,6 +202,7 @@ sudo apt-get remove open-fprintd fprintd-clients python3-validity
 sudo apt-get install fprintd libpam-fprintd
 sudo pam-auth-update --enable fprintd   # re-links PAM to the stock module
 sudo rm -rf /etc/systemd/system/python3-validity.service.d
+sudo rm -rf /etc/systemd/system/open-fprintd-resume.service.d
 sudo add-apt-repository --remove ppa:uunicorn/open-fprintd
 ```
 

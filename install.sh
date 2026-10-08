@@ -17,8 +17,10 @@
 #   4. Downloads+extracts the sensor firmware from Lenovo's Windows
 #      driver package (done automatically by the python3-validity
 #      postinst script on first install).
-#   5. Disables the driver's default --debug logging (it dumps every
-#      TLS frame to the journal otherwise).
+#   5. Installs systemd drop-ins: disables the driver's default --debug
+#      logging (it dumps every TLS frame to the journal otherwise), and
+#      makes resume-from-suspend restart the driver (the sensor drops off
+#      the USB bus on resume, and the stock resume hook can't recover).
 #   6. Enables fingerprint auth in PAM (pam-auth-update --enable fprintd).
 #
 # What this script deliberately does NOT do:
@@ -82,16 +84,53 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y open-fprintd fprintd-clie
 # --- 4. Firmware is fetched by the python3-validity postinst automatically.
 #        Nothing to do here; just sanity check the service can start.
 
-# --- 5. Quiet down the debug logging ------------------------------------
-OVERRIDE_DIR=/etc/systemd/system/python3-validity.service.d
-if [[ ! -f "$OVERRIDE_DIR/override.conf" ]]; then
-  log "Disabling verbose --debug logging on python3-validity.service"
-  sudo mkdir -p "$OVERRIDE_DIR"
-  printf '[Service]\nExecStart=\nExecStart=/usr/lib/python-validity/dbus-service\n' | sudo tee "$OVERRIDE_DIR/override.conf" >/dev/null
-  sudo systemctl daemon-reload
+# --- 5. systemd drop-ins ---------------------------------------------------
+# Writes $2 to $1 if the file is missing or differs, so re-running the
+# script upgrades drop-ins installed by an older version of it.
+# Returns 0 if the file changed.
+install_dropin() {
+  local path="$1" content="$2"
+  if [[ -f "$path" ]] && [[ "$(cat "$path")" == "$content" ]]; then
+    return 1
+  fi
+  sudo mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$content" | sudo tee "$path" >/dev/null
+}
+
+# Drop --debug (it logs every TLS frame), and retry if the sensor isn't
+# ready yet when the service starts.
+if install_dropin /etc/systemd/system/python3-validity.service.d/override.conf \
+'[Service]
+ExecStart=
+ExecStart=/usr/lib/python-validity/dbus-service
+Restart=on-failure
+RestartSec=2'; then
+  log "Installed python3-validity.service override (no --debug, restart on failure)"
 else
-  log "Debug-logging override already present, skipping."
+  log "python3-validity.service override already up to date, skipping."
 fi
+
+# On resume the sensor can re-enumerate on USB, leaving the driver holding a
+# stale handle; the stock resume hook then fails with "No such device" and
+# the reader stays dead until reboot. Restart the driver first, then still
+# run the stock hook: it's also what clears open-fprintd's "suspended" flag.
+if install_dropin /etc/systemd/system/open-fprintd-resume.service.d/override.conf \
+'[Service]
+# The sensor can re-enumerate on USB after resume, leaving python3-validity
+# with a stale handle; Resume() then fails with "No such device". Restart
+# the driver first, then still call resume.py: it also clears open-fprintd'"'"'s
+# own "suspended" flag, without which every request is queued forever.
+ExecStart=
+ExecStartPre=/bin/udevadm settle --timeout=10
+ExecStart=/bin/systemctl restart python3-validity.service
+ExecStart=/usr/lib/open-fprintd/resume.py'; then
+  log "Installed open-fprintd-resume.service override (restart driver after suspend)"
+else
+  log "open-fprintd-resume.service override already up to date, skipping."
+fi
+
+sudo systemctl daemon-reload
+sudo systemctl reset-failed open-fprintd-resume.service 2>/dev/null || true
 
 log "Restarting driver services…"
 sudo systemctl enable --now python3-validity.service open-fprintd.service
